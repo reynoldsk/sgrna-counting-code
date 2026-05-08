@@ -4,6 +4,7 @@ import numpy as np
 import os
 import sys
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from pathlib import Path
 from Bio import SeqIO
 from scipy.stats import linregress
@@ -39,7 +40,7 @@ class Experiment(ABC):
     - counts_directory: The directory containing count files for the experiment.
     - vial_id: The ID of the vial for which to load counts.
     - timepoints: A list of time points for the experiment.
-    - files: a generator of files in the counts directory that match the vial_id pattern.
+    - files: a list of files in the counts directory that match the vial_id pattern.
     - barcodes: A list of barcodes for the experiment, which are technical replicates.
     """
 
@@ -70,7 +71,7 @@ class Experiment(ABC):
         """
         self.counts_directory = counts_directory
         self.vial_id = vial_id
-        self.files = counts_directory.rglob(f"*{vial_id}*.csv")
+        self.files = list(counts_directory.rglob(f"*{vial_id}*.csv"))
         self.timepoints = timepoints
         self.barcodes = barcodes
         if isinstance(sgRNAs, Path):
@@ -79,6 +80,7 @@ class Experiment(ABC):
             self.sgRNA2seq, self.seq2sgRNA, self.guides_list = sgRNAs
         self.plotting = plotting
         self.plot_directory = plot_directory
+        os.makedirs(self.plot_directory, exist_ok=True)
 
     def build_guide_dict(
         self,
@@ -140,6 +142,14 @@ class Experiment(ABC):
             [series for _, _, series in records],
             index=index,
         ).sort_index(level="timepoint")
+
+    @contextmanager
+    def _figure(self, figsize: tuple[int, int] = (8, 6)):
+        fig, ax = plt.subplots(figsize=figsize)
+        try:
+            yield fig, ax
+        finally:
+            plt.close(fig)
 
     def relative_frequency(self, counts: pd.DataFrame) -> pd.DataFrame:
         """
@@ -214,36 +224,55 @@ class Experiment(ABC):
             DataFrame with barcode as index and sgRNAs as columns containing growth rate slopes.
         """
 
-        # if plotting to monitor, choose a single sgRNA and plot for all frequencies
-        if self.plotting:
-            example_sgRNA = self.guides_list[0]
-            plt.figure(figsize=(8, 6))
-            for barcode in log_freq.index.get_level_values("barcode").unique():
-                subset = log_freq.xs(barcode, level="barcode")
-                t = [
-                    timepoint_values[tp]
-                    for tp in subset.index.get_level_values("timepoint")
-                ]
-                plt.plot(
-                    t, subset[example_sgRNA], marker="o", label=f"Barcode {barcode}"
-                )
-            plt.xlabel("Time (hours)")
-            plt.ylabel(f"Log2 Relative Frequency of {example_sgRNA}")
-            plt.title(f"Growth of {example_sgRNA} over time by barcode")
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(
-                f"{self.plot_directory}/growth_plot_{self.vial_id}_{example_sgRNA}.png"
-            )
-            plt.close()
-
         def _slope(group):
             t = [
                 timepoint_values[tp] for tp in group.index.get_level_values("timepoint")
             ]
             return group.apply(lambda col: linregress(t, col).slope)
 
-        return log_freq.groupby(level="barcode").apply(_slope)
+        def _intercept(group):
+            t = [
+                timepoint_values[tp] for tp in group.index.get_level_values("timepoint")
+            ]
+            return group.apply(lambda col: linregress(t, col).intercept)
+
+        grs = log_freq.groupby(level="barcode").apply(_slope)
+        intercepts = log_freq.groupby(level="barcode").apply(_intercept)
+
+        if self.plotting:
+            example_sgRNA = self.guides_list[0]
+            with self._figure() as (fig, ax):
+                for barcode in grs.index:
+                    group = log_freq.xs(barcode, level="barcode")
+                    t = np.array(
+                        [
+                            timepoint_values[tp]
+                            for tp in group.index.get_level_values("timepoint")
+                        ]
+                    )
+                    ax.scatter(
+                        t, group[example_sgRNA], marker="o", label=f"Barcode {barcode}"
+                    )
+                    ax.plot(
+                        t,
+                        grs.loc[barcode, example_sgRNA] * t
+                        + intercepts.loc[barcode, example_sgRNA],
+                        marker="x",
+                        label=f"Fit {barcode}",
+                    )
+                ax.set_xlabel("Time (hours)")
+                ax.set_ylabel(f"Log2 Relative Frequency of {example_sgRNA}")
+                ax.set_title(f"Growth of {example_sgRNA} over time by barcode")
+                ax.legend()
+                ax.grid(True)
+                fig.savefig(
+                    f"{self.plot_directory}/growth_plot_{self.vial_id}_{example_sgRNA}.png"
+                )
+
+        return grs
+    
+    def plot_growth_rates(self, growth_rates: pd.DataFrame) -> None:
+        pass
 
     def escaper_correction(self, growth_rates: pd.DataFrame) -> pd.DataFrame:
         """
@@ -257,19 +286,23 @@ class Experiment(ABC):
         Returns
         -------
         pd.DataFrame
-            Corrected growth rates.
+            Corrected growth rates with outlier (barcode, sgRNA) cells set to NaN.
         """
-        q_stat, outlier_barcode = growth_rates.apply(self.dixon_q_test, axis=0).iloc[0]
-        if outlier_barcode is not None:
-            print(
-                f"Outlier detected in barcode {outlier_barcode} with Q statistic {q_stat:.3f}. Applying escaper correction."
-            )
-            return growth_rates.drop(index=outlier_barcode)
-        else:
-            print(
-                "No outliers detected by Dixon's Q test. No escaper correction applied."
-            )
-            return growth_rates
+        corrected = growth_rates.copy()
+        results = growth_rates.apply(self.dixon_q_test, axis=0)
+        print(results)
+        # results rows: 0 = q_statistic, 1 = outlier_barcode (or None)
+        outlier_barcodes = results.iloc[1]
+
+        for sgRNA, barcode in outlier_barcodes.items():
+            print(f"barcode: {barcode}")
+            if barcode is not None and not pd.isna(barcode):
+                # print(
+                #     f"Outlier detected for {sgRNA} in barcode {barcode}. Applying escaper correction."
+                # )
+                corrected.loc[barcode, sgRNA] = np.nan
+
+        return corrected
 
     @classmethod
     def dixon_critical_value(cls, n: int) -> float | None:
@@ -304,6 +337,8 @@ class Experiment(ABC):
         """
         Perform Dixon's Q test for outliers on a Series of growth rates.
 
+        Gets the minimum outlier or the maximum outlier, if there is any
+
         Parameters
         ----------
         data : pd.Series
@@ -319,15 +354,32 @@ class Experiment(ABC):
             return False, None  # Not enough data points for the test
 
         ## 95% confidence level interval
+
+        ## if the 2 datapoints are the same, can't do the test
         if sorted_data.iloc[0] == sorted_data.iloc[-1]:
             return False, None
-        q_statistic = (sorted_data.iloc[1] - sorted_data.iloc[0]) / (
+
+        ## check min and max q statistics:
+        min_q_statistic = (sorted_data.iloc[1] - sorted_data.iloc[0]) / (
             sorted_data.iloc[-1] - sorted_data.iloc[0]
         )
+        max_q_statistic = (sorted_data.iloc[-1] - sorted_data.iloc[-2]) / (
+            sorted_data.iloc[-1] - sorted_data.iloc[0]
+        )
+        if min_q_statistic > max_q_statistic:
+            q_statistic = min_q_statistic
+            index_to_remove = 0
+        elif max_q_statistic > min_q_statistic:
+            q_statistic = max_q_statistic
+            index_to_remove = -1
+        else:
+            ## this case should never happen
+            return False, None  # Both statistics are the same, can't determine outlier
+
         q_critical = cls.dixon_critical_value(n)
         is_outlier = q_statistic > q_critical if q_critical is not None else False
 
-        outlier_barcode = sorted_data.index[0] if is_outlier else None
+        outlier_barcode = sorted_data.index[index_to_remove] if is_outlier else None
         return q_statistic, outlier_barcode
 
     @abstractmethod
@@ -397,6 +449,8 @@ class SelfNonTargetingExperiment(Experiment):
         barcodes: list[str],
         sgRNAs: tuple[dict[str, str], dict[str, str], list[str]] | Path,
         neg_control_sgRNA: str = "NTC",
+        plotting: bool = True,
+        plot_directory: Path = Path("plots-monitoring"),
     ):
         super().__init__(counts_directory, vial_id, timepoints, barcodes, sgRNAs)
         self.neg_control_sgRNA = neg_control_sgRNA
