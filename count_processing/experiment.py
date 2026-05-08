@@ -1,15 +1,13 @@
-from sympy.functions.elementary.benchmarks.bench_exp import q
 import pandas as pd
 import numpy as np
 import os
-import sys
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from pathlib import Path
 from Bio import SeqIO
 from scipy.stats import linregress
 import matplotlib.pyplot as plt
-
+import logging
 
 """
 Experiment should define an experiment and its assumptions,
@@ -23,7 +21,8 @@ An experiment contains all of the reads for a single
 experimental condition (vial), and runs the growth rate
 calculation for each barcode. 
 
-Barcodes are biological replicates.
+Barcodes are biological replicates. Multiple runs with 
+different biological constructs.
 
 Each experiment should be able to run the whole pipeline:
 load counts --> split by time and barcode --> 
@@ -37,11 +36,20 @@ class Experiment(ABC):
     Initialize an experiment with its assumptions and conditions.
 
     Fields:
+    ---------
     - counts_directory: The directory containing count files for the experiment.
     - vial_id: The ID of the vial for which to load counts.
     - timepoints: A list of time points for the experiment.
     - files: a list of files in the counts directory that match the vial_id pattern.
     - barcodes: A list of barcodes for the experiment, which are technical replicates.
+    - sgRNA2seq: A dictionary mapping sgRNA ids to their corresponding homology sequences.
+    - seq2sgRNA: A dictionary mapping homology sequences to their corresponding sgRNA ids
+    - guides_list: A list of sgRNA ids.
+    - plotting: Whether to generate plots for the experiment.
+    - plot_directory: The directory where plots will be saved if plotting is True.
+    - logger: A logging.Logger instance for logging messages, or None to print to console.
+    - neg_control_sgRNA: The ID of the negative control sgRNA used for normalization.
+    - intercepts: A DataFrame to store intercepts from growth rate fitting for plotting purposes.
     """
 
     def __init__(
@@ -51,8 +59,10 @@ class Experiment(ABC):
         timepoints: list[str],
         barcodes: list[str],
         sgRNAs: tuple[dict[str, str], dict[str, str], list[str]] | Path,
+        neg_control_sgRNA: str = "NTC",
         plotting: bool = True,
         plot_directory: Path = Path("plots-monitoring"),
+        logger: logging.Logger | None = None,
     ):
         """
         Initialize the experiment with the directory containing count files.
@@ -68,6 +78,7 @@ class Experiment(ABC):
             - seq2sgRNA: A dictionary mapping homology sequences to their corresponding sgRNA ids.
             - guides_list: A list of sgRNA ids.
         plotting (bool): Whether to generate plots for the experiment. Default is True.
+        neg_control_sgRNA (str): The ID of the negative control sgRNA. Default is "NTC".
         """
         self.counts_directory = counts_directory
         self.vial_id = vial_id
@@ -81,6 +92,8 @@ class Experiment(ABC):
         self.plotting = plotting
         self.plot_directory = plot_directory
         os.makedirs(self.plot_directory, exist_ok=True)
+        self.logger = logger
+        self.neg_control_sgRNA = neg_control_sgRNA
 
     def build_guide_dict(
         self,
@@ -145,6 +158,10 @@ class Experiment(ABC):
 
     @contextmanager
     def _figure(self, figsize: tuple[int, int] = (8, 6)):
+        """
+        Context manager for creating and closing a matplotlib figure. Allows us to plot a set of figures on the
+        same figure axes.
+        """
         fig, ax = plt.subplots(figsize=figsize)
         try:
             yield fig, ax
@@ -202,10 +219,10 @@ class Experiment(ABC):
         pd.DataFrame
             Log2 of freq; t0-normalized input will have 0 at baseline.
         """
-        return np.log2(freq)  # ty: ignore ; this does return a DataFrame
+        return np.log2(freq)  # ty: ignore ; this does return a DataFrame actually
 
     def growth_rates(
-        self, log_freq: pd.DataFrame, timepoint_values: dict[str, float]
+        self, log_freq: pd.DataFrame, timepoint_values: dict[str, int]
     ) -> pd.DataFrame:
         """
         Compute per-sgRNA growth rates as the slope of log2 frequency vs time,
@@ -215,7 +232,7 @@ class Experiment(ABC):
         ----------
         log_freq : pd.DataFrame
             MultiIndex DataFrame (timepoint, barcode) × sgRNAs of log2 frequencies.
-        timepoint_values : dict[str, float]
+        timepoint_values : dict[str, int]
             Mapping from timepoint label to numeric value (e.g. {"T-3": -3, "T00": 0, "T08": 8}).
 
         Returns
@@ -224,55 +241,77 @@ class Experiment(ABC):
             DataFrame with barcode as index and sgRNAs as columns containing growth rate slopes.
         """
 
-        def _slope(group):
-            t = [
-                timepoint_values[tp] for tp in group.index.get_level_values("timepoint")
-            ]
-            return group.apply(lambda col: linregress(t, col).slope)
+        def _col_mask(col: pd.Series, t_labels: list[str]) -> float:
+            mask = np.isfinite(col.values)
+            if mask.sum() < 2:
+                return np.nan
+            t = np.array([timepoint_values[tp] for tp in t_labels[mask]])
+            return linregress(t, col.values[mask]).slope
 
-        def _intercept(group):
-            t = [
-                timepoint_values[tp] for tp in group.index.get_level_values("timepoint")
-            ]
-            return group.apply(lambda col: linregress(t, col).intercept)
+        def _slope(group: pd.DataFrame) -> pd.Series:
+            t_labels = group.index.get_level_values("timepoint")
+            return group.apply(_col_mask, args=(t_labels,))
+
+        def _intercept(group: pd.DataFrame) -> pd.Series:
+            t_labels = group.index.get_level_values("timepoint")
+            return group.apply(_col_mask, args=(t_labels,))
 
         grs = log_freq.groupby(level="barcode").apply(_slope)
-        intercepts = log_freq.groupby(level="barcode").apply(_intercept)
+
+        ## save intercepts in the object for plotting
+        self.intercepts = log_freq.groupby(level="barcode").apply(_intercept)
 
         if self.plotting:
-            example_sgRNA = self.guides_list[0]
-            with self._figure() as (fig, ax):
-                for barcode in grs.index:
-                    group = log_freq.xs(barcode, level="barcode")
-                    t = np.array(
-                        [
-                            timepoint_values[tp]
-                            for tp in group.index.get_level_values("timepoint")
-                        ]
-                    )
-                    ax.scatter(
-                        t, group[example_sgRNA], marker="o", label=f"Barcode {barcode}"
-                    )
-                    ax.plot(
-                        t,
-                        grs.loc[barcode, example_sgRNA] * t
-                        + intercepts.loc[barcode, example_sgRNA],
-                        marker="x",
-                        label=f"Fit {barcode}",
-                    )
-                ax.set_xlabel("Time (hours)")
-                ax.set_ylabel(f"Log2 Relative Frequency of {example_sgRNA}")
-                ax.set_title(f"Growth of {example_sgRNA} over time by barcode")
-                ax.legend()
-                ax.grid(True)
-                fig.savefig(
-                    f"{self.plot_directory}/growth_plot_{self.vial_id}_{example_sgRNA}.png"
-                )
+            sgRNA = self.guides_list[0]  # Just plot the first sgRNA for now
+            self.plot_growth_rates(sgRNA, grs, log_freq, timepoint_values)
 
         return grs
-    
-    def plot_growth_rates(self, growth_rates: pd.DataFrame) -> None:
-        pass
+
+    def plot_growth_rates(
+        self,
+        sgRNA: str,
+        grs: pd.DataFrame,
+        log_freq: pd.DataFrame,
+        timepoint_values: dict[str, int],
+    ) -> None:
+        """
+        Plot the growth of a single sgRNA over time by barcode, with points for the log2 
+        relative frequencies and lines for the fitted growth rates.
+
+        Parameters
+        ----------
+        sgRNA : str
+            The sgRNA to plot.
+        grs : pd.DataFrame
+            DataFrame with barcode as index and sgRNAs as columns containing growth rate slopes.
+        log_freq : pd.DataFrame
+            MultiIndex DataFrame (timepoint, barcode) × sgRNAs of log2 frequencies.
+        timepoint_values : dict[str, int]
+            Mapping from timepoint label to numeric value (e.g. {"T-3": -3, "T00": 0, ... "T08": 8}).
+        """
+
+        with self._figure() as (fig, ax):
+            for barcode in grs.index:
+                group = log_freq.xs(barcode, level="barcode")
+                t = np.array(
+                    [
+                        timepoint_values[tp]
+                        for tp in group.index.get_level_values("timepoint")
+                    ]
+                )
+                ax.scatter(t, group[sgRNA], marker="o", label=f"Barcode {barcode}")
+                ax.plot(
+                    t,
+                    grs.loc[barcode, sgRNA] * t + self.intercepts.loc[barcode, sgRNA],
+                    marker="x",
+                    label=f"Fit {barcode}",
+                )
+            ax.set_xlabel("Time (hours)")
+            ax.set_ylabel(f"Log2 Relative Frequency of {sgRNA}")
+            ax.set_title(f"Growth of {sgRNA} over time by barcode")
+            ax.legend()
+            ax.grid(True)
+            fig.savefig(f"{self.plot_directory}/growth_plot_{self.vial_id}_{sgRNA}.png")
 
     def escaper_correction(self, growth_rates: pd.DataFrame) -> pd.DataFrame:
         """
@@ -290,19 +329,39 @@ class Experiment(ABC):
         """
         corrected = growth_rates.copy()
         results = growth_rates.apply(self.dixon_q_test, axis=0)
-        print(results)
         # results rows: 0 = q_statistic, 1 = outlier_barcode (or None)
         outlier_barcodes = results.iloc[1]
 
         for sgRNA, barcode in outlier_barcodes.items():
-            print(f"barcode: {barcode}")
             if barcode is not None and not pd.isna(barcode):
-                # print(
-                #     f"Outlier detected for {sgRNA} in barcode {barcode}. Applying escaper correction."
-                # )
+                self.log(
+                    f"Outlier detected for {sgRNA} in barcode {barcode}. Applying escaper correction.",
+                    logging.INFO,
+                )
                 corrected.loc[barcode, sgRNA] = np.nan
 
         return corrected
+
+    def log(self, message: str, level: int = logging.INFO) -> None:
+        """
+        Log a message using the experiment's logger if available, otherwise print to console.
+
+        Parameters
+        ----------
+        message : str
+            The message to log.
+        level : int
+            The logging level (e.g. logging.INFO, logging.WARNING). Default is logging.INFO.
+
+        Returns
+        -------
+        None
+            This method does not return a value, but logs the message using the logger or prints it to the console.
+        """
+        if self.logger is not None:
+            self.logger.log(level, message)
+        else:
+            print(message)
 
     @classmethod
     def dixon_critical_value(cls, n: int) -> float | None:
@@ -317,7 +376,8 @@ class Experiment(ABC):
         Returns
         -------
         float
-            The critical value for Dixon's Q test at a 95% confidence level.
+            The critical value for Dixon's Q test at a 95% confidence level. 
+            If n is not in the predefined range, returns None.
         """
         q_critical: dict[int, float] = {
             3: 0.970,
@@ -346,8 +406,10 @@ class Experiment(ABC):
 
         Returns
         -------
-        the test statistic and the barcode that is an outlier.
+        tuple[float, str | None]
+            The test statistic and the barcode that is an outlier.
         """
+
         sorted_data = data.sort_values()
         n = len(sorted_data)
         if n < 3:
@@ -388,6 +450,16 @@ class Experiment(ABC):
         Extract the normalizing counts from the counts DataFrame — typically the counts of a
         non-targeting control sgRNA. Returns a Series indexed by (timepoint, barcode) used
         to divide each row in relative_frequency.
+
+        Parameters
+        ----------
+        counts: pd.DataFrame
+            MultiIndex DataFrame (timepoint, barcode) × sgRNAs with raw counts.
+
+        Returns
+        -------
+        pd.Series
+            Series indexed by (timepoint, barcode) containing the normalizing counts for each row in counts
         """
         raise NotImplementedError("Subclasses must implement this method")
 
@@ -396,13 +468,23 @@ class Experiment(ABC):
         """
         Collapse the pairwise sgRNA count matrix into a 1D Series (sgRNA → count)
         according to the experimental design.
+
+        Parameters
+        ----------
+        counts_df : pd.DataFrame
+            DataFrame with sgRNAs as both rows and columns
+
+        Returns
+        -------
+        pd.Series
+            Series indexed by sgRNA with the aggregated counts according to the experiment design.
         """
         raise NotImplementedError("Subclasses must implement this method")
 
 
 class SelfSelfExperiment(Experiment):
     """
-    Plasmid has the same sgRNAs in either direction on the plasmid.
+    Plasmid has the same sgRNAs in both directions.
     """
 
     def aggregate_sgrna(self, counts_df: pd.DataFrame) -> pd.Series:
@@ -420,7 +502,10 @@ class SelfSelfExperiment(Experiment):
         pd.Series
             Series indexed by sgRNA with the sum of counts across columns.
         """
-        pass
+        sgRNA_counts = []
+        for sgRNA in counts_df.columns:
+            sgRNA_counts.append(counts_df.loc[sgRNA, sgRNA])
+        return pd.Series(sgRNA_counts, index=counts_df.columns)
 
     def get_normalizing_counts(self, counts: pd.DataFrame) -> pd.Series:
         """
@@ -437,24 +522,10 @@ class SelfSelfExperiment(Experiment):
         pd.Series
             Series indexed by (timepoint, barcode) containing the counts of the non-targeting control sgRNA.
         """
-        pass
+        return counts[self.neg_control_sgRNA]
 
 
 class SelfNonTargetingExperiment(Experiment):
-    def __init__(
-        self,
-        counts_directory: Path,
-        vial_id: str,
-        timepoints: list[str],
-        barcodes: list[str],
-        sgRNAs: tuple[dict[str, str], dict[str, str], list[str]] | Path,
-        neg_control_sgRNA: str = "NTC",
-        plotting: bool = True,
-        plot_directory: Path = Path("plots-monitoring"),
-    ):
-        super().__init__(counts_directory, vial_id, timepoints, barcodes, sgRNAs)
-        self.neg_control_sgRNA = neg_control_sgRNA
-
     """
     Plasmid has the same sgRNAs in one direction, and non-targeting controls in the other.
     """
