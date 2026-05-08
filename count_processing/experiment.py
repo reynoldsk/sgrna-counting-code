@@ -267,6 +267,26 @@ class Experiment(ABC):
 
         return grs
 
+    def average_growth_rates(self, growth_rates: pd.DataFrame) -> pd.DataFrame:
+        """
+        Average growth rates across barcodes for each sgRNA.
+
+        Parameters
+        ----------
+        growth_rates : pd.DataFrame
+            DataFrame with barcode as index and sgRNAs as columns containing growth rate slopes.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with sgRNAs as index and columns for mean, std, and sem.
+        """
+        means: pd.Series = growth_rates.mean(axis=0)
+        stds: pd.Series = growth_rates.std(axis=0)
+        sem: pd.Series = growth_rates.sem(axis=0)
+        stat_df = pd.DataFrame({"mean": means, "std": stds, "sem": sem}).T
+        return stat_df
+
     def plot_growth_rates(
         self,
         sgRNA: str,
@@ -275,7 +295,7 @@ class Experiment(ABC):
         timepoint_values: dict[str, int],
     ) -> None:
         """
-        Plot the growth of a single sgRNA over time by barcode, with points for the log2 
+        Plot the growth of a single sgRNA over time by barcode, with points for the log2
         relative frequencies and lines for the fitted growth rates.
 
         Parameters
@@ -376,7 +396,7 @@ class Experiment(ABC):
         Returns
         -------
         float
-            The critical value for Dixon's Q test at a 95% confidence level. 
+            The critical value for Dixon's Q test at a 95% confidence level.
             If n is not in the predefined range, returns None.
         """
         q_critical: dict[int, float] = {
