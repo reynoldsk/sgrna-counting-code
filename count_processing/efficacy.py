@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import logging
 from .experiment import Experiment
 from pathlib import Path
+import natsort
 
 """
 We attempt to calculate repression efficacy of sgRNAs
@@ -46,7 +47,13 @@ class EfficacyEstimator:
     methods where we do not have the gold standard qtPCR data to directly measure repression efficacy.
     """
 
-    def __init__(self, average_growth_rates: pd.DataFrame, genes: set[str] | Path):
+    def __init__(
+        self,
+        average_growth_rates: pd.DataFrame,
+        genes: set[str] | Path,
+        sgRNAs: set[str],
+    ):
+        self.sgRNAs = sgRNAs
         if isinstance(genes, Path):
             with open(genes, "r") as f:
                 self.genes = [line.strip() for line in f]
@@ -55,29 +62,111 @@ class EfficacyEstimator:
             self.genes = genes
         self.average_growth_rates = average_growth_rates
 
-    def rank_sgRNAs_by_mismatch_position(self) -> pd.DataFrame:
+    def rank_sgRNAs_by_mismatch_position(
+        self, negative_control: str | None = None
+    ) -> pd.DataFrame:
         """
         Rank sgRNAs by their mismatch position and number of mismatches, assuming that sgRNAs with fewer mismatches and mismatches further from the PAM are more effective.
 
         We rank first based on position of the mismatch,
         and then by the number of mismatches.
 
+        We assume a certain naming convention for each sgRNA:
+
+        <gene name>_<attempt # at making an sgRNA>_<nucleotide in coding sequence targeted>_<Mismatch Strategy>
+
+        Mismatch strategy:
+        - C: no mismatches
+        - B/W: some mismatches, followed by MM (number of mismatches))
+        if B or W
+
+        Example:
+        fmt_1_37_B_MM4
+        - fmt gene
+        - 1st attempt
+        - targets 37th nucleotide
+        - B mismatch strategy
+        - 4 mismatches
+
+        Sometimes they don't have a mismatch strategy, in which case we need to process num mismatches directly
+
+        This does not depend on growth rates at all.
+
+        Parameters
+        ----------
+        negative_control : str | None
+            Identifier for negative control sgRNA, if it does not follow the same naming convention.
+            If provided, will be included in the ranking manually
+
         Returns
         -------
         pd.DataFrame
-            DataFrame with sgRNAs ranked by mismatch position and number, including columns for sgRNA identifier, number of mismatches, and mismatch positions.
+            DataFrame with sgRNAs ranked by mismatch position and number, including columns for sgRNA identifier,
+            number of mismatches, and mismatch positions.
         """
+        sgRNA_rankings = []
 
-        pass
+        for sgRNA in self.sgRNAs:
+            parts = sgRNA.split("_")
+
+            ## negative controls may not follow the same convention
+            if len(parts) < 4 or len(parts) > 5:
+                logging.warning(
+                    f"sgRNA {sgRNA} does not follow expected naming convention."
+                )
+                continue
+            gene, attempt, position_str, mismatch_strategy = parts[:4]
+            try:
+                position = int(position_str)
+            except ValueError:
+                logging.warning(f"sgRNA {sgRNA} has invalid position: {position_str}")
+                continue
+            num_mismatches = (
+                0
+                if mismatch_strategy == "C"
+                else int(parts[4].split("MM")[1])
+                if len(parts) == 5
+                else int(mismatch_strategy.split("MM")[1])
+            )
+            sgRNA_rankings.append((sgRNA, gene, position, num_mismatches))
+
+        if negative_control:
+            sgRNA_rankings.append(
+                (
+                    negative_control,
+                    negative_control.split("_")[0],
+                    float("inf"),
+                    float("inf"),
+                )
+            )  # Add negative control at the end of the ranking
+
+        ranked_sgRNAs = pd.DataFrame(
+            sgRNA_rankings,
+            columns=np.array(["sgRNA", "gene", "position", "num_mismatches"]),
+        )
+
+        ranked_sgRNAs = ranked_sgRNAs.sort_values(
+            by=["position", "num_mismatches"], ascending=[True, True]
+        ).reset_index(drop=True)
+
+        growth_rates = self.average_growth_rates.copy()
+
+        genes_in_data = [
+            next((g for g in self.genes if g in sgRNA), None)
+            for sgRNA in ranked_sgRNAs["sgRNA"]
+        ]
+
+        growth_rates.columns = pd.MultiIndex.from_arrays(
+            [ranked_sgRNAs["sgRNA"], genes_in_data], names=["sgRNA", "gene"]
+        )
+
+        return growth_rates
 
     def rank_sgRNAs_by_growth_rate(self) -> pd.DataFrame:
         """
         Rank sgRNAs by their growth rates, assuming that lower growth rates correspond to higher repression efficacy.
 
-        Rank, then normalize the growth rates to a 0-1 scale for
-        each vial, weigh the ranking by this normalized growth
-        rate, and then normalize again to 0-1 to get
-        the repression efficacy, per Phil
+        This method depends on cross-vial ranking.
 
         Returns
         -------
@@ -85,14 +174,94 @@ class EfficacyEstimator:
             DataFrame with sgRNAs ranked by growth rate, including columns for sgRNA identifier, growth rate, and gene.
         """
 
-        ranked_sgRNAs = self.average_growth_rates.sort_values(by="mean", axis=1)
+        ranked_sgRNAs = self.average_growth_rates.copy()
+        
+        ranked_sgRNAs = ranked_sgRNAs.sort_values(
+            by="mean", axis=1, ascending=True
+        )
+
+        ranked_cols = (
+            ranked_sgRNAs.columns.get_level_values("sgRNA")
+            if isinstance(ranked_sgRNAs.columns, pd.MultiIndex)
+            else ranked_sgRNAs.columns
+        )
 
         genes_in_data = [
-            next((g for g in self.genes if g in sgRNA), None)
-            for sgRNA in ranked_sgRNAs.columns
+            next((g for g in self.genes if g in sgRNA), None) for sgRNA in ranked_cols
         ]
         ranked_sgRNAs.columns = pd.MultiIndex.from_arrays(
-            [ranked_sgRNAs.columns, genes_in_data], names=["sgRNA", "gene"]
+            [ranked_cols, genes_in_data], names=["sgRNA", "gene"]
         )
-        
+
         return ranked_sgRNAs
+
+    def get_gene_epistasis_dict(
+        self, ranked_sgrnas: pd.DataFrame, gene: str
+    ) -> dict[str, tuple[float, float, pd.Series]]:
+        """
+        Compute repression efficacy for sgRNAs targeting a specific gene.
+
+        Groups ranked_sgrnas by the gene level of the MultiIndex columns, then
+        applies per Phil:
+        1. Rank sgRNAs within the gene by mean value (ascending: lower = rank 1)
+        2. Weight rank by normalized value
+
+        Works with output from either rank_sgRNAs_by_growth_rate or
+        rank_sgRNAs_by_mismatch_position.
+
+        rank by growth_rate requires another step across media condition:
+
+        3. Average rank across media conditions
+        4. Rescale to [0, 1]
+
+        Parameters
+        ----------
+        ranked_sgrnas : pd.DataFrame
+            Index is ["mean", "std", "sem"]; columns are a MultiIndex (sgRNA, gene).
+        gene : str
+            Gene to compute efficacy for.
+
+        Returns
+        -------
+        dict[str, tuple[float, float]]
+            Mapping of sgRNA identifier to (repression efficacy score in [0, 1], mean value).
+        """
+        gene_data = ranked_sgrnas.xs(gene, level="gene", axis=1)
+        mean_vals = gene_data.loc["mean"]
+        abs_vals = mean_vals.abs()
+
+        ranks = abs_vals.rank(ascending=True)
+
+        # Y-axis: signed growth rate normalized to [-1, 1], preserving sign through 0
+        # max_abs = abs_vals.max()
+        # normalized = (
+        #     mean_vals / max_abs
+        #     if max_abs != 0
+        #     else pd.Series(0.0, index=mean_vals.index)
+        # )
+
+        # looking at growth rate effect size:
+        normalized = (abs_vals - abs_vals.min()) / (abs_vals.max() - abs_vals.min())
+
+        # X-axis ordering: rank by absolute effect, weighted by normalized absolute range
+        val_range = abs_vals.max() - abs_vals.min()
+        if val_range == 0:
+            return {
+                sgRNA: (0.0, mean_vals[sgRNA], normalized[sgRNA])
+                for sgRNA in gene_data.columns
+            }
+        abs_normalized = (abs_vals - abs_vals.min()) / val_range
+        weighted = ranks * abs_normalized
+
+        span = weighted.max() - weighted.min()
+        if span == 0:
+            return {
+                sgRNA: (0.0, mean_vals[sgRNA], normalized[sgRNA])
+                for sgRNA in gene_data.columns
+            }
+
+        efficacy = (weighted - weighted.min()) / span
+        return {
+            sgRNA: (efficacy[sgRNA], mean_vals[sgRNA], normalized[sgRNA])
+            for sgRNA in gene_data.columns
+        }

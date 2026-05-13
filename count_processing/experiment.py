@@ -583,3 +583,81 @@ class SelfNonTargetingExperiment(Experiment):
             Series indexed by (timepoint, barcode) containing the counts of the non-targeting control sgRNA.
         """
         return counts[self.neg_control_sgRNA]
+
+
+class SelfNonSelfExperiment(Experiment):
+    """
+    Plasmid has the same sgRNAs in one direction, and different sgRNAs in the other.
+    """
+
+    def __init__(
+        self,
+        counts_directory: Path,
+        vial_id: str,
+        timepoints: list[str],
+        barcodes: list[str],
+        sgRNAs: tuple[dict[str, str], dict[str, str], list[str]] | Path,
+        sgRNA_pairs: tuple[str, str],
+        neg_control_sgRNA: str = "NTC",
+        plotting: bool = True,
+        plot_directory: Path = Path("plots-monitoring"),
+        logger: logging.Logger | None = None,
+    ):
+        super().__init__(
+            counts_directory,
+            vial_id,
+            timepoints,
+            barcodes,
+            sgRNAs,
+            neg_control_sgRNA,
+            plotting,
+            plot_directory,
+            logger,
+        )
+
+        self.sgRNA_pairs = sgRNA_pairs
+
+    def aggregate_sgrna(self, counts_df: pd.DataFrame) -> pd.Series:
+        """
+        For this experiment design, the count files have sgRNAs as rows and different sgRNAs as columns.
+        We want to sum across the columns to get a single count per sgRNA.
+
+        Parameters
+        ----------
+        counts_df : pd.DataFrame
+            DataFrame with sgRNAs as rows and different sgRNAs as columns.
+
+        Returns
+        -------
+        pd.Series
+            Series indexed by sgRNA with the sum of counts across columns.
+        """
+
+        sgRNA_counts = []
+        for sgRNA_pair in self.sgRNA_pairs:
+            if (
+                sgRNA_pair[0] not in counts_df.index
+                or sgRNA_pair[1] not in counts_df.columns
+            ):
+                raise ValueError(
+                    f"sgRNA pair {sgRNA_pair} not found in counts DataFrame index and columns."
+                )
+            sgRNA_counts.append(counts_df.loc[sgRNA_pair[0], sgRNA_pair[1]])
+        return pd.Series(sgRNA_counts, index=counts_df.columns)
+
+    def get_normalizing_counts(self, counts: pd.DataFrame) -> pd.Series:
+        """
+        For this experiment design, the normalizing counts are the
+        counts of the non-targeting control sgRNA, which is in the columns.
+
+        Parameters
+        ----------
+        counts : pd.DataFrame
+            MultiIndex DataFrame (timepoint, barcode) × sgRNAs with raw counts.
+
+        Returns
+        -------
+        pd.Series
+            Series indexed by (timepoint, barcode) containing the counts of the non-targeting control sgRNA.
+        """
+        return counts[self.neg_control_sgRNA]
