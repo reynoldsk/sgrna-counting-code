@@ -1,16 +1,7 @@
 import pandas as pd
 import numpy as np
-import os
-from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from pathlib import Path
-from Bio import SeqIO
-from scipy.stats import linregress
-import matplotlib.pyplot as plt
 import logging
-from .experiment import Experiment
-from pathlib import Path
-import natsort
 
 """
 We attempt to calculate repression efficacy of sgRNAs
@@ -106,6 +97,7 @@ class EfficacyEstimator:
         """
         sgRNA_rankings = []
 
+        ## get mismatch position and number of mismatches from sgRNA naming
         for sgRNA in self.sgRNAs:
             parts = sgRNA.split("_")
 
@@ -130,6 +122,7 @@ class EfficacyEstimator:
             )
             sgRNA_rankings.append((sgRNA, gene, position, num_mismatches))
 
+        ## add the negative control if one is provided
         if negative_control:
             sgRNA_rankings.append(
                 (
@@ -175,10 +168,8 @@ class EfficacyEstimator:
         """
 
         ranked_sgRNAs = self.average_growth_rates.copy()
-        
-        ranked_sgRNAs = ranked_sgRNAs.sort_values(
-            by="mean", axis=1, ascending=True
-        )
+
+        ranked_sgRNAs = ranked_sgRNAs.sort_values(by="mean", axis=1, ascending=True)
 
         ranked_cols = (
             ranked_sgRNAs.columns.get_level_values("sgRNA")
@@ -226,6 +217,7 @@ class EfficacyEstimator:
         dict[str, tuple[float, float]]
             Mapping of sgRNA identifier to (repression efficacy score in [0, 1], mean value).
         """
+
         gene_data = ranked_sgrnas.xs(gene, level="gene", axis=1)
         mean_vals = gene_data.loc["mean"]
         abs_vals = mean_vals.abs()
@@ -265,3 +257,64 @@ class EfficacyEstimator:
             sgRNA: (efficacy[sgRNA], mean_vals[sgRNA], normalized[sgRNA])
             for sgRNA in gene_data.columns
         }
+
+    def average_ranks_across_conditions(
+        self,
+        ranked_sgrnas_list: list[pd.DataFrame],
+    ) -> dict[str, dict[str, float]]:
+        """
+        Average per-gene weighted ranks across media conditions and rescale to [0, 1].
+
+        Per Phil's method: for each condition, rank sgRNAs within a gene by absolute
+        mean growth rate, then weight each rank by the gene-level range of growth rates.
+        Average the weighted ranks across conditions, then rescale per gene to [0, 1].
+
+        Parameters
+        ----------
+        ranked_sgrnas_list : list[pd.DataFrame]
+            One DataFrame per media condition (vial). Each has MultiIndex columns
+            (sgRNA, gene) and index containing at least "mean".
+
+        Returns
+        -------
+        dict[str, dict[str, float]]
+            Mapping of gene -> {sgRNA -> efficacy in [0, 1]}.
+        """
+        # Accumulate weighted ranks per sgRNA across conditions
+        all_weighted: dict[str, list[float]] = {}
+        sgRNA_to_gene: dict[str, str] = {}
+
+        for ranked_df in ranked_sgrnas_list:
+            mean_vals = ranked_df.loc["mean"]
+            for sgRNA, gene in zip(
+                mean_vals.index.get_level_values("sgRNA"),
+                mean_vals.index.get_level_values("gene"),
+            ):
+                sgRNA_to_gene[sgRNA] = gene
+
+            for gene in mean_vals.index.get_level_values("gene").unique():
+                gene_means = mean_vals.xs(gene, level="gene").abs()
+                val_range = gene_means.max() - gene_means.min()
+                ranks = gene_means.rank(ascending=True)
+                weighted = ranks * val_range
+                for sgRNA, w in weighted.items():
+                    all_weighted.setdefault(sgRNA, []).append(w)
+
+        avg_weighted = pd.Series(
+            {sgRNA: np.mean(ws) for sgRNA, ws in all_weighted.items()}
+        )
+
+        # Group by gene and rescale each gene's sgRNAs to [0, 1]
+        result: dict[str, dict[str, float]] = {}
+        for gene in set(sgRNA_to_gene.values()):
+            sgrnas = [s for s, g in sgRNA_to_gene.items() if g == gene]
+            gene_vals = avg_weighted.reindex(sgrnas)
+            span = gene_vals.max() - gene_vals.min()
+            if span == 0:
+                result[gene] = {s: 0.0 for s in sgrnas}
+            else:
+                rescaled = (gene_vals - gene_vals.min()) / span
+                result[gene] = rescaled.to_dict()
+        
+
+        return result

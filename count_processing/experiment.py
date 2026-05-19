@@ -58,7 +58,7 @@ class Experiment(ABC):
         vial_id: str,
         timepoints: list[str],
         barcodes: list[str],
-        sgRNAs: tuple[dict[str, str], dict[str, str], list[str]] | Path,
+        sgRNAs: list[str] | Path,
         neg_control_sgRNA: str = "NTC",
         plotting: bool = True,
         plot_directory: Path = Path("plots-monitoring"),
@@ -72,11 +72,8 @@ class Experiment(ABC):
         vial_id (str): The ID of the vial for which to load counts.
         timepoints (list[str]): A list of time points for the experiment.
         barcodes (list[str]): A list of barcodes for the experiment, which are biological replicates.
-        sgRNAs (tuple[dict[str, str], dict[str, str], list[str]] | Path): Either a path to a fasta file
-        containing sgRNA sequences and ids, or a tuple of (sgRNA2seq, seq2sgRNA, guides_list) where:
-            - sgRNA2seq: A dictionary mapping sgRNA ids to their corresponding homology sequences.
-            - seq2sgRNA: A dictionary mapping homology sequences to their corresponding sgRNA ids.
-            - guides_list: A list of sgRNA ids.
+        sgRNAs (list[str] | Path): Either a path to a fasta file
+        containing sgRNA sequences and ids, or a list of sgRNA ids.
         plotting (bool): Whether to generate plots for the experiment. Default is True.
         neg_control_sgRNA (str): The ID of the negative control sgRNA. Default is "NTC".
         """
@@ -86,22 +83,21 @@ class Experiment(ABC):
         self.timepoints = timepoints
         self.barcodes = barcodes
         if isinstance(sgRNAs, Path):
-            self.build_guide_dict(sgRNAs)
+            self.build_guide_list(sgRNAs)
         else:
-            self.sgRNA2seq, self.seq2sgRNA, self.guides_list = sgRNAs
+            self.guides_list = sgRNAs
         self.plotting = plotting
         self.plot_directory = plot_directory
         os.makedirs(self.plot_directory, exist_ok=True)
         self.logger = logger
         self.neg_control_sgRNA = neg_control_sgRNA
 
-    def build_guide_dict(
+    def build_guide_list(
         self,
         fasta_file: Path,
     ) -> None:
         """
-        From the fasta file, take the sequences and their id to create a dictionary of sgRNA id to
-        homology sequence and homology sequence to sgRNA id, as well as a list of the sgRNA ids.
+        From the fasta file, take the sequences and their id to create a list of the sgRNA ids.
 
         Parameters
         -----------
@@ -112,22 +108,13 @@ class Experiment(ABC):
         --------
         None
             This method does not return a value, but it populates the instance variables:
-            - self.sgRNA2seq: A dictionary mapping sgRNA ids to their corresponding homology sequences.
-            - self.seq2sgRNA: A dictionary mapping homology sequences to their corresponding sgRNA ids.
             - self.guides_list: A list of sgRNA ids.
         """
 
-        sgRNA2seq: dict[str, str] = {}
-        seq2sgRNA: dict[str, str] = {}
-
-        # find homology + reverse complement of homology from PW_Folate_corrected.fa
+        guides_list = []
+        # find homology + reverse complement of homology from a fasta file
         for record in SeqIO.parse(fasta_file, "fasta"):
-            homologous_seq = str(record.seq[35:55].reverse_complement())
-            seq2sgRNA[homologous_seq] = str(record.id)
-            sgRNA2seq[str(record.id)] = homologous_seq
-        guides_list = list(sgRNA2seq.keys())
-        self.sgRNA2seq = sgRNA2seq
-        self.seq2sgRNA = seq2sgRNA
+            guides_list.append(str(record.id))
         self.guides_list = guides_list
 
     def read_time_library(self) -> pd.DataFrame:
@@ -399,16 +386,38 @@ class Experiment(ABC):
             The critical value for Dixon's Q test at a 95% confidence level.
             If n is not in the predefined range, returns None.
         """
+        q95 = [
+            0.97,
+            0.829,
+            0.71,
+            0.625,
+            0.568,
+            0.526,
+            0.493,
+            0.466,
+            0.444,
+            0.426,
+            0.41,
+            0.396,
+            0.384,
+            0.374,
+            0.365,
+            0.356,
+            0.349,
+            0.342,
+            0.337,
+            0.331,
+            0.326,
+            0.321,
+            0.317,
+            0.312,
+            0.308,
+            0.305,
+            0.301,
+            0.29,
+        ]
         q_critical: dict[int, float] = {
-            3: 0.970,
-            4: 0.829,
-            5: 0.710,
-            6: 0.625,
-            7: 0.568,
-            8: 0.526,
-            9: 0.493,
-            10: 0.466,
-            # Add more values as needed
+            n: q for n, q in zip(range(3, len(q95) + 1), q95)
         }
         return q_critical.get(n, None)  # Return None if n is not in the dictionary
 
@@ -596,7 +605,7 @@ class SelfNonSelfExperiment(Experiment):
         vial_id: str,
         timepoints: list[str],
         barcodes: list[str],
-        sgRNAs: tuple[dict[str, str], dict[str, str], list[str]] | Path,
+        sgRNAs: list[str] | Path,
         sgRNA_pairs: tuple[str, str],
         neg_control_sgRNA: str = "NTC",
         plotting: bool = True,
@@ -649,6 +658,49 @@ class SelfNonSelfExperiment(Experiment):
         """
         For this experiment design, the normalizing counts are the
         counts of the non-targeting control sgRNA, which is in the columns.
+
+        Parameters
+        ----------
+        counts : pd.DataFrame
+            MultiIndex DataFrame (timepoint, barcode) × sgRNAs with raw counts.
+
+        Returns
+        -------
+        pd.Series
+            Series indexed by (timepoint, barcode) containing the counts of the non-targeting control sgRNA.
+        """
+        return counts[self.neg_control_sgRNA]
+
+
+class UnpairedExperiment(Experiment):
+    """
+    For this experiment design, there is a single sgRNA per plasmid.
+    The count files have sgRNAs as columns and a single row of counts.
+
+    The normalizing counts are the counts of the non-targeting control sgRNA, which is in the rows.
+    """
+
+    def aggregate_sgrna(self, counts_df: pd.DataFrame) -> pd.Series:
+        """
+        For this experiment design, the count files have sgRNAs as rows and a single column of counts.
+        We want to return the counts as a Series indexed by sgRNA.
+
+        Parameters
+        ----------
+        counts_df : pd.DataFrame
+            DataFrame with sgRNAs as rows and a single column of counts.
+
+        Returns
+        -------
+        pd.Series
+            Series indexed by sgRNA with the counts.
+        """
+        return counts_df.iloc[:, 0]  # Assuming the counts are in the first column
+
+    def get_normalizing_counts(self, counts: pd.DataFrame) -> pd.Series:
+        """
+        For this experiment design, the normalizing counts are the
+        counts of the non-targeting control sgRNA, which is in the rows.
 
         Parameters
         ----------
